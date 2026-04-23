@@ -1,82 +1,85 @@
-name: release
+name: Parallel Multi-Arch Build
 
-on: 
-  create:
+on:
   push:
-    branches:
-      - master
-      - 'v*'
-    tags:
-      - 'v*'
+    branches: [ "v1.0" ]
 
-# TODO: Migrate building manifests and kubectl plugins from Cloud Build
+env:
+  # Define your base image name here to avoid repetition
+  IMAGE_NAME: public.ecr.aws/citizensadvice/hnc-manager
+
 jobs:
-  hnc-manager:
-    runs-on: ubuntu-latest
+  # JOB 1: Build the individual architectures in parallel
+  build-architectures:
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.PUBLIC_PUSH_ECR_AWS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.PUBLIC_PUSH_ECR_AWS_SECRET }}
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            
+    runs-on: ${{ matrix.runner }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v1
-
-      - name: Set Release Tag
-        run: |
-          TAG="${GITHUB_REF#refs/*/v}"
-          echo "RELEASE_TAG=${TAG}" >> $GITHUB_ENV
-
-      - name: Set Build Date
-        id: date
-        run: |
-          echo "::set-output name=HNC_BUILD_TIMESTAMP::$(date -u +'%Y-%m-%dT%H-%M-%S')"
-
-      - name: Set up Cloud SDK
-        uses: google-github-actions/setup-gcloud@master
-        with:
-        # GCR_KEY is the service account key in json which is base64 encoded and stored in the secrets section of the repo.
-        # We think that the Service account only requires the permission to push to the required registry but we're not certain
-          service_account_key: ${{ secrets.GCR_KEY }}
-          export_default_credentials: true
-        
-      # Configure docker to use the gcloud command-line tool as a credential helper
-      - run: |
-          # Set up docker to authenticate
-          # via gcloud command-line tool.
-          gcloud auth configure-docker
-
-      - name: Docker meta
-        id: docker_meta
-        uses: docker/metadata-action@v3
-        with:
-          images: gcr.io/k8s-staging-multitenancy/hnc-manager
-          tags: |
-            type=raw,value=multiarch-{{branch}}-${{ steps.date.outputs.HNC_BUILD_TIMESTAMP }}
-  
-      - name: Print Tags
-        run: |
-          echo "${{ steps.docker_meta.outputs.tags }}"
-          echo "RELEASE TAG: ${RELEASE_TAG}"
-
-    ## QEMU is an emulator which makes it possible to transalte instruction sets to different platforms.
-    ## In this step, we setup the driver which Docker can use to build images on different platforms
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v1
-        with:
-          platforms: all
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
       - name: Set up Docker Buildx
-        id: buildx
-        uses: docker/setup-buildx-action@v1
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37
         with:
-          version: v0.5.1
+          aws-region: us-east-1 # ECR Public can only be logged into from the us-east-1 region.
 
+      - name: ECR login
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@19d944daaa35f0fa1d3f7f8af1d3f2e5de25c5b7
+        with:
+          registry-type: public
 
-      - name: Build & Push Image
-        uses: docker/build-push-action@v2
+      - name: Build and push architecture-specific image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f
         with:
           context: .
-          file: ./Dockerfile
+          platforms: linux/${{ matrix.arch }}
           push: true
-          platforms: linux/amd64, linux/arm64, linux/arm/v7
-          tags: |
-            ${{ steps.docker_meta.outputs.tags }}
-          build-args: |
-            DBUILD_DATE=${{ steps.date.outputs.HNC_BUILD_TIMESTAMP }}
-            DBUILD_REPO_URL=https://github.com/kubernetes-sigs/hierarchical-namespaces
+          # We use the commit SHA + architecture as a temporary tag (e.g., 8a9b2c-amd64)
+          tags: ${{ env.IMAGE_NAME }}:${{ github.sha }}-${{ matrix.arch }}
+
+  # JOB 2: Combine the images into a single manifest
+  create-manifest:
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.PUBLIC_PUSH_ECR_AWS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.PUBLIC_PUSH_ECR_AWS_SECRET }}
+
+    # This job MUST wait for both matrix builds to finish
+    needs: build-architectures
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37
+        with:
+          aws-region: us-east-1 # ECR Public can only be logged into from the us-east-1 region.
+
+      - name: ECR login
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@19d944daaa35f0fa1d3f7f8af1d3f2e5de25c5b7
+        with:
+          registry-type: public
+
+      - name: Create and push multi-arch manifest
+        # We use imagetools to pull the arch-specific tags from the registry 
+        # and combine them under the 'latest' and commit SHA tags.
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE_NAME }}:latest \
+            -t ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64 \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64
