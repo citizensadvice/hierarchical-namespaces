@@ -1,6 +1,6 @@
 module sigs.k8s.io/hierarchical-namespaces
 
-go 1.21
+go 1.25.0
 
 require (
 	contrib.go.opencensus.io/exporter/prometheus v0.4.0
@@ -80,7 +80,7 @@ require (
 	golang.org/x/mod v0.10.0 // indirect
 	golang.org/x/net v0.17.0 // indirect
 	golang.org/x/oauth2 v0.7.0 // indirect
-	golang.org/x/sync v0.1.0
+	golang.org/x/sync v0.20.0
 	golang.org/x/sys v0.13.0 // indirect
 	golang.org/x/term v0.13.0 // indirect
 	golang.org/x/text v0.13.0
